@@ -1,0 +1,343 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+Cargar librerias
+```{r}
+suppressMessages({
+  library(tidyverse)
+  library(Amelia)
+  library(ggplot2)
+  library(ROCR)
+  library(cowplot)
+  library(caret)
+  library(e1071)
+  library(lubridate)
+})
+```
+# Carga y chequeo de datos
+
+Cargar datos -- columna X1 sera usada como ID unica
+```{r}
+CaudalDF=read_delim(file=unz(description='Data/caudal_extra.csv.zip', filename='caudal_extra.csv'), delim=',')
+```
+Chequear columnas que no son unicas para eliminar informacion irrelevante.
+Las columnas institucion y fuentes no varian.
+```{r}
+CaudalDF[,which(unlist(lapply(X=CaudalDF, FUN=function(x){
+  length(unique(x))
+}))==1)]=NULL
+```
+Investigar estructura de la tabla
+```{r}
+str(CaudalDF)
+```
+
+La tabla no esta ordenada por fecha -- ordenar
+```{r}
+CaudalDF=CaudalDF[order(CaudalDF$fecha),]
+```
+
+### Pregunta 2
+
+
+Generar mapa de missing values
+```{r}
+suppressWarnings(missmap(obj=CaudalDF))
+```
+
+Un 10% de los valores de temperatura maxima promedio son missing data.
+Esto puede deberse a que (citando al texto guia) 'pueden haber cuencias sin estaciones de temperatura o precipitacion'
+```{r}
+sum(is.na(CaudalDF$temp_max_promedio))*100/nrow(CaudalDF)
+```
+El mismo caso anterior pero para la precipitacion promedio, donde el 1.9% son missing data.
+```{r}
+sum(is.na(CaudalDF$precip_promedio))*100/nrow(CaudalDF)
+```
+La extension de los missing values alcanza solo hasta un 10%, por lo tanto se establece que es seguro eliminarlos
+```{r}
+CaudalDF=na.omit(CaudalDF)
+```
+
+### Pregunta 3
+
+Funcion para graficar caudal, precipitacion promedio y temperatura maxima promedio dada cierta estacion y rango de fechas
+```{r}
+plot_estaciones_varias_columnas=function(codigo_estacion, fecha_min, fecha_max){
+  
+  #Subset en base a argumentos
+  SubsetDF=CaudalDF[CaudalDF$codigo_estacion==codigo_estacion &
+      CaudalDF$fecha>=as.POSIXct(x=fecha_min, tz='UTC') & 
+      CaudalDF$fecha<=as.POSIXct(x=fecha_max, tz='UTC'),]
+  
+  #Dejar solo informacion necesaria
+  SubsetDF=SubsetDF[,c('fecha','caudal','precip_promedio','temp_max_promedio')]
+  
+  #Normalizacion por minimo y maximo. Mismo tratamiento para cada columna de dato
+  Normalized=as.data.frame(sapply(X=SubsetDF[,-1], FUN=function(x){
+    (x-min(x))/(max(x)-min(x))
+  }))
+  
+  #Agregar fecha
+  Normalized$fecha=SubsetDF$fecha
+  
+  #Grafico de lineas
+  P1=ggplot() +
+    geom_line(data=Normalized, aes(x=fecha, y=caudal), color='blue') +
+    geom_line(data=Normalized, aes(x=fecha, y=temp_max_promedio), color='green') +
+    geom_line(data=Normalized, aes(x=fecha, y=precip_promedio), color='orange')
+  
+  return(P1)
+  
+}
+```
+Probar funcion
+```{r}
+plot_estaciones_varias_columnas(codigo_estacion='11335002', 
+  fecha_min='2017-01-01', fecha_max='2017-07-01')
+```
+
+### Pregunta 4
+
+Generar variables
+```{r}
+CaudalDF$caudal_extremo=0
+CaudalDF$temp_extremo=0
+CaudalDF$precip_extremo=0
+```
+
+Obtener percentil 95 por estacion del año para caudal temperatura y precipitacion
+
+```{r}
+UniqueYear=sort(unique(format(x=CaudalDF$fecha, '%Y')))
+for(i in 1:length(UniqueYear)){
+  
+  #El verano comienza en diciembre del año anterior y continua al año siguiente
+  #Si i es igual al total de años, evitar que busque en un año que no existe
+  if(i!=length(UniqueYear)){
+    #### Verano
+    #Buscar meses que corresponden a verano para cada año
+    VeranoMax=CaudalDF[CaudalDF$fecha > 
+        as.POSIXct(x=paste0(UniqueYear[i],'-12-22'), tz='UTC') & 
+        CaudalDF$fecha <= 
+        as.POSIXct(x=paste0(UniqueYear[i+1],'-03-20'), tz='UTC'),]
+    
+    if(nrow(VeranoMax)!=0){
+      #Obtener valores extremos sobre el percentil 95 y extraer ID unica para cada variable
+      IDNumCaudal=VeranoMax[which(VeranoMax$caudal>=quantile(x=VeranoMax$caudal, c(.95))),]$X1
+      IDNumTemp=VeranoMax[which(VeranoMax$temp_max_promedio>=quantile(x=VeranoMax$temp_max_promedio, c(.95))),]$X1
+      IDNumPrecip=VeranoMax[which(VeranoMax$precip_promedio>=quantile(x=VeranoMax$precip_promedio, c(.95))),]$X1
+      
+      #Anotar en tabla original basandose en ID unica
+      CaudalDF[CaudalDF$X1 %in% IDNumCaudal,]$caudal_extremo=1
+      CaudalDF[CaudalDF$X1 %in% IDNumTemp,]$temp_extremo=1
+      CaudalDF[CaudalDF$X1 %in% IDNumPrecip,]$precip_extremo=1
+    }
+  }
+  
+  ##### Invierno
+  #Buscar meses que corresponden a invierno para cada año
+  InviernoMax=CaudalDF[CaudalDF$fecha >= 
+      as.POSIXct(x=paste0(UniqueYear[i],'-06-21'), tz='UTC') & 
+      CaudalDF$fecha < 
+      as.POSIXct(x=paste0(UniqueYear[i],'-09-23'), tz='UTC'),]
+  
+  if(nrow(InviernoMax)!=0){
+    #Obtener valores extremos sobre el percentil 95 y extraer ID unica para cada variable
+    IDNumCaudal=InviernoMax[which(InviernoMax$caudal>=quantile(x=InviernoMax$caudal, c(.95))),]$X1
+    IDNumTemp=InviernoMax[which(InviernoMax$temp_max_promedio>=quantile(x=InviernoMax$temp_max_promedio, c(.95))),]$X1
+    IDNumPrecip=InviernoMax[which(InviernoMax$precip_promedio>=quantile(x=InviernoMax$precip_promedio, c(.95))),]$X1
+    
+    #Anotar en tabla original basandose en ID unica
+    CaudalDF[CaudalDF$X1 %in% IDNumCaudal,]$caudal_extremo=1
+    CaudalDF[CaudalDF$X1 %in% IDNumTemp,]$temp_extremo=1
+    CaudalDF[CaudalDF$X1 %in% IDNumPrecip,]$precip_extremo=1
+  }
+  
+  ##### Primavera
+  #Buscar meses que corresponden a invierno para cada año
+  PrimaveraMax=CaudalDF[CaudalDF$fecha >= 
+      as.POSIXct(x=paste0(UniqueYear[i],'-09-23'), tz='UTC') & 
+      CaudalDF$fecha <= 
+      as.POSIXct(x=paste0(UniqueYear[i],'-12-22'), tz='UTC'),]
+  
+  if(nrow(PrimaveraMax)!=0){
+    #Obtener valores extremos sobre el percentil 95 y extraer ID unica para cada variable
+    IDNumCaudal=PrimaveraMax[which(PrimaveraMax$caudal>=quantile(x=PrimaveraMax$caudal, c(.95))),]$X1
+    IDNumTemp=PrimaveraMax[which(PrimaveraMax$temp_max_promedio>=quantile(x=PrimaveraMax$temp_max_promedio, c(.95))),]$X1
+    IDNumPrecip=PrimaveraMax[which(PrimaveraMax$precip_promedio>=quantile(x=PrimaveraMax$precip_promedio, c(.95))),]$X1
+    
+    #Anotar en tabla original basandose en ID unica
+    CaudalDF[CaudalDF$X1 %in% IDNumCaudal,]$caudal_extremo=1
+    CaudalDF[CaudalDF$X1 %in% IDNumTemp,]$temp_extremo=1
+    CaudalDF[CaudalDF$X1 %in% IDNumPrecip,]$precip_extremo=1
+  }
+  
+  #Otono
+  #Buscar meses que corresponden a invierno para cada año
+  OtonoMax=CaudalDF[CaudalDF$fecha > 
+      as.POSIXct(x=paste0(UniqueYear[i],'-03-20'), tz='UTC') & 
+      CaudalDF$fecha < 
+      as.POSIXct(x=paste0(UniqueYear[i],'-06-21'), tz='UTC'),]
+  
+  if(nrow(OtonoMax)!=0){
+    #Obtener valores extremos sobre el percentil 95 y extraer ID unica para cada variable
+    IDNumCaudal=OtonoMax[which(OtonoMax$caudal>=quantile(x=OtonoMax$caudal, c(.95))),]$X1
+    IDNumTemp=OtonoMax[which(OtonoMax$temp_max_promedio>=quantile(x=OtonoMax$temp_max_promedio, c(.95))),]$X1
+    IDNumPrecip=OtonoMax[which(OtonoMax$precip_promedio>=quantile(x=OtonoMax$precip_promedio, c(.95))),]$X1
+    
+    #Anotar en tabla original basandose en ID unica
+    CaudalDF[CaudalDF$X1 %in% IDNumCaudal,]$caudal_extremo=1
+    CaudalDF[CaudalDF$X1 %in% IDNumTemp,]$temp_extremo=1
+    CaudalDF[CaudalDF$X1 %in% IDNumPrecip,]$precip_extremo=1
+  }
+  
+}
+```
+
+Otra variable para definir climas extremos seria tomar los valores mas extremos (altos y bajos) considerando la data historica anual completa. En vez de ver el percentil 95 por año, considerar los ultimos 10 o 20 años y considerar  los maximos y minimos para cada variable como extremos
+
+### Pregunta 5
+
+Calcular promedio de caudal extremo y su desviacion estandar
+```{r}
+CuencaCaudal=aggregate(x=CaudalDF[,c('caudal_extremo')], by=list(CaudalDF$codigo_cuenca), FUN=function(x){
+  c("Mean"=mean(x, na.rm=TRUE), 'SD'=sd(x, na.rm=TRUE))
+})
+```
+
+Almacenar codigo de cuenta antes de modificar la tabla resultante
+```{r}
+CuencaID=CuencaCaudal$Group.1
+```
+
+Pasar resultado a tabla
+```{r}
+CuencaCaudal=as.data.frame(CuencaCaudal$caudal_extremo)
+```
+
+Agregar codigo de cuenca como factor 
+```{r}
+CuencaCaudal$CuencaID=as.factor(CuencaID)
+```
+Graficar -- Existen diferencias de niveles extremos de caudales entre las distintas cuencas.
+Ademas de eso, como los promedios ignoran el año, se puede decir que una misma cuenca ha sufrido muchas variaciones en los niveles extremos de caudales.
+```{r}
+ggplot(data=CuencaCaudal, aes(x=CuencaID, y=Mean)) + geom_col() + 
+  geom_errorbar(aes(ymin=Mean-SD, ymax=Mean+SD))
+```
+
+### Pregunta 6
+
+Calcular valores acumulativos para cada parametro extremo
+```{r}
+CaudalDF$Caudal_Acumulativo=cumsum(x=CaudalDF$caudal_extremo)
+CaudalDF$Temp_Acumulativo=cumsum(x=CaudalDF$temp_extremo)
+CaudalDF$Precip_Acumulativo=cumsum(x=CaudalDF$precip_extremo)
+```
+
+Generar graficos
+```{r}
+P1=ggplot() + geom_line(data=CaudalDF, aes(x=fecha, y=Caudal_Acumulativo), color='blue')
+P2=ggplot() + geom_line(data=CaudalDF, aes(x=fecha, y=Temp_Acumulativo), color='green')
+P3=ggplot() + geom_line(data=CaudalDF, aes(x=fecha, y=Precip_Acumulativo), color='orange') 
+```
+
+Grilla con graficos -- los eventos extremos son mas comunes ahora.
+La linea no muestra un plateau, no se mantiene, al contrario, solo sigue creciendo.
+```{r}
+plot_grid(plotlist=list(P1,P2,P3), nrow=1, ncol=3)
+```
+
+### Pregunta 7
+
+Calcular promedio de caudal en fechas que son iguales
+```{r}
+CaudalMean=aggregate(x=CaudalDF[,c('caudal')], by=list(CaudalDF$fecha), FUN=mean)
+```
+Se observa una tendencia anual
+
+```{r}
+ggplot() + geom_line(data=CaudalMean, aes(x=Group.1, y=caudal, group=1)) +
+  scale_x_datetime(date_breaks='1 years') + 
+  theme(axis.text.x=element_text(angle=90, hjust=1))
+```
+
+Remover variables acumulativas y de nombres
+```{r}
+CaudalDF$Precip_Acumulativo=NULL
+CaudalDF$Temp_Acumulativo=NULL
+CaudalDF$Caudal_Acumulativo=NULL
+CaudalDF$nombre=NULL
+CaudalDF$nombre_sub_cuenca=NULL
+CaudalDF$gauge_name=NULL
+```
+
+Generar Train y test set. Se tomara el 70% de los datos para entrenar el modelo y el 30% para probar el modelo.
+Si se tiene en consideracion la temporalidad, lo mas coherente es tomar la primera porcion como entrenamiento (fechas mas antiguas) y la segunda como prueba. La segunda porcion (fechas mas recientes) serian datos del 'futuro'.
+
+Generar Test y Train set.
+
+```{r}
+TrainDF=CaudalDF[1:floor(nrow(CaudalDF)*70/100),]
+TestDF=CaudalDF[(floor(nrow(CaudalDF)*70/100)+1):nrow(CaudalDF),]
+```
+
+
+Entrenar modelo en base al caudal y precipitaciones.
+Con este modelo se pretende poder predecir caudales extremos en base a precipitaciones.
+Como las precipitaciones se estiman con datos meteorologicos, es posible predecir un evento de caudal extremo.
+Tomar solo precipitaciones es una solucion razonable en terminos de obtencion de datos.
+Seria posible usar tambien informacion del caudal, sin embargo no seria logico y promueve el overfitting (debido a que se esta prediciendo un caudal extremo en base al caudal mismo).
+
+```{r}
+ModelTemp=lm(formula=caudal_extremo ~ precip_promedio + precip_extremo, data=TrainDF)
+summary(ModelTemp)
+```
+
+Este modelo podria utilizarse tomando datos de estaciones meteorologicas, en conjunto con (o provistos por) la Direccion Meteorologica de Chile
+
+### Pregunta 8
+
+## Pregunta 8A
+
+ROC -- La curva muestra bajos falsos positivos y altos verdaderos positivos
+
+```{r}
+PredROC=prediction(predict(ModelTemp), TrainDF$caudal_extremo)
+plot(performance(PredROC, 'tpr', 'fpr'))
+```
+
+Predict values
+```{r}
+Predicted=predict(object=ModelTemp, newdata=TestDF)
+```
+
+Confussion Matrix -- Accuracy 0.95 -- Recall 0.95
+```{r}
+PredictedTreshold=ifelse(test=Predicted>=0.5, yes=1, no=0)
+confusionMatrix(as.factor(TestDF$caudal_extremo),
+  as.factor(PredictedTreshold), mode = "prec_recall")
+```
+
+Resample
+RMSE de 0.21, pequeno para un rango de variable dependiente que va de 0 a 1
+```{r}
+postResample(pred=Predicted, obs=TestDF$caudal_extremo)
+```
+
+Variables importantes
+Rehacer modelo con todas las variables para ver cuales son las mas importantes
+```{r}
+ModelVar=lm(formula=caudal_extremo ~ ., data=TrainDF)
+summary(ModelVar)
+```
+## Pregunta 8B
+En este notebook se dividio la informacion para entrenar el modelo, dejando un 70% de los datos.
+Si se capturan 70% de los eventos de caudales, seria equivalente a set de entrenamiento utilizado en este documento y la precision seria la misma.
+
+
